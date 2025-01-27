@@ -12,13 +12,22 @@
  */
 package org.openhab.binding.mcp23017.internal.handler;
 
-import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.*;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.ADDRESS;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.BUS_NUMBER;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.CHANNEL_GROUP_INPUT;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.CHANNEL_GROUP_OUTPUT;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.SUPPORTED_CHANNELS;
+import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.SUPPORTED_CHANNEL_GROUPS;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 
-import org.openhab.binding.mcp23017.internal.GPIODataHolder;
-import org.openhab.binding.mcp23017.internal.PinMapper;
+import org.apache.commons.lang3.tuple.Pair;
+import org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants;
+import org.openhab.binding.mcp23017.internal.i2c.I2CBusManager;
+import org.openhab.binding.mcp23017.internal.i2c.I2CBusManagerHolder;
 import org.openhab.core.config.core.Configuration;
 import org.openhab.core.library.types.OnOffType;
 import org.openhab.core.library.types.OpenClosedType;
@@ -31,34 +40,36 @@ import org.openhab.core.types.Command;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import com.pi4j.gpio.extension.mcp.MCP23017GpioProvider;
-import com.pi4j.io.gpio.GpioPin;
-import com.pi4j.io.gpio.GpioPinDigitalInput;
-import com.pi4j.io.gpio.GpioPinDigitalOutput;
-import com.pi4j.io.gpio.Pin;
-import com.pi4j.io.gpio.PinPullResistance;
-import com.pi4j.io.gpio.PinState;
-import com.pi4j.io.gpio.event.GpioPinDigitalStateChangeEvent;
-import com.pi4j.io.gpio.event.GpioPinListenerDigital;
-import com.pi4j.io.i2c.I2CFactory.UnsupportedBusNumberException;
-
 /**
  * The {@link Mcp23017Handler} is base class for MCP23017 chip support
  *
  * @author Anatol Ogorek - Initial contribution
+ * @author Igor Arenz - Rebuild for communication via libc instead of Pi4j
  */
-public class Mcp23017Handler extends BaseThingHandler implements GpioPinListenerDigital {
+public class Mcp23017Handler extends BaseThingHandler {
 
     private final Logger logger = LoggerFactory.getLogger(getClass());
 
-    private MCP23017GpioProvider mcpProvider;
-    private Integer address;
-    private Integer busNumber;
-    private Mcp23017PinStateHolder pinStateHolder;
+    private byte i2cAddress;
+    private byte i2cBusNumber;
+    private I2CBusManager i2cBusManager;
+
     /**
      * the polling interval mcp23071 check interrupt register (optional, defaults to 50ms)
      */
     private static final int POLLING_INTERVAL = 50;
+
+    // Pair<BankName, PinNo> -> Channel
+    private Map<Pair<String, Byte>, ChannelUID> inputChannels = new HashMap<>();
+    private Map<Pair<String, Byte>, ChannelUID> outputChannels = new HashMap<>();
+
+    // Register-Values
+    byte IODIRA = 0;
+    byte IODIRB = 0;
+    byte GPPUA = 0;
+    byte GPPUB = 0;
+    byte OLATA = 0;
+    byte OLATB = 0;
 
     public Mcp23017Handler(Thing thing) {
         super(thing);
@@ -75,14 +86,19 @@ public class Mcp23017Handler extends BaseThingHandler implements GpioPinListener
 
         String channelGroup = channelUID.getGroupId();
 
-        switch (channelGroup) {
-            case CHANNEL_GROUP_INPUT:
-                handleInputCommand(channelUID, command);
-                break;
-            case CHANNEL_GROUP_OUTPUT:
-                handleOutputCommand(channelUID, command);
-            default:
-                break;
+        try {
+            switch (channelGroup) {
+                case CHANNEL_GROUP_INPUT:
+                    handleInputCommand(channelUID, command);
+                    break;
+                case CHANNEL_GROUP_OUTPUT:
+                    handleOutputCommand(channelUID, command);
+                default:
+                    break;
+            }
+        } catch (IOException e) {
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                    "An exception communication. Exception: " + e.getMessage());
         }
     }
 
@@ -90,13 +106,259 @@ public class Mcp23017Handler extends BaseThingHandler implements GpioPinListener
     public void initialize() {
         try {
             checkConfiguration();
-            mcpProvider = initializeMcpProvider();
-            pinStateHolder = new Mcp23017PinStateHolder(mcpProvider, this.thing);
+
+            this.i2cBusManager = I2CBusManagerHolder.getBusManager(i2cBusNumber);
+            startPollingThread();
             updateStatus(ThingStatus.ONLINE);
+        } catch (IOException e) {
+            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                    "An exception communication. Exception: " + e.getMessage());
         } catch (IllegalArgumentException | SecurityException e) {
             updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
                     "An exception occurred while adding pin. Check pin configuration. Exception: " + e.getMessage());
         }
+    }
+
+    @Override
+    public void dispose() {
+        super.dispose();
+        // TODO: Kill thread
+    }
+
+    @Override
+    public void channelLinked(ChannelUID channelUID) {
+        synchronized (this) {
+            logger.error("channel linked {}", channelUID.getAsString());
+            if (!verifyChannel(channelUID)) {
+                return;
+            }
+            String channelGroup = channelUID.getGroupId();
+
+            try {
+                if (channelGroup != null) {
+                    if (channelGroup.equals(CHANNEL_GROUP_INPUT)) {
+                        initializeInputPin(channelUID);
+                    }
+
+                    if (channelGroup.equals(CHANNEL_GROUP_OUTPUT)) {
+                        initializeOutputPin(channelUID);
+                    }
+                }
+                super.channelLinked(channelUID);
+            } catch (IllegalArgumentException e) {
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
+                        "Exception: " + e.getMessage());
+            } catch (IOException e) {
+                updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                        "An exception communication. Exception: " + e.getMessage());
+            }
+
+        }
+    }
+
+    private void initializeInputPin(ChannelUID channel) throws IOException {
+        logger.error("initializing input pin for channel {}", channel.getAsString());
+
+        String pullMode = Mcp23017BindingConstants.PULL_MODE_DEFAULT;
+        if (thing.getChannel(channel.getId()) != null) {
+            Configuration configuration = thing.getChannel(channel.getId()).getConfiguration();
+            pullMode = ((String) configuration.get(Mcp23017BindingConstants.PULL_MODE)) != null
+                    ? ((String) configuration.get(Mcp23017BindingConstants.PULL_MODE))
+                    : Mcp23017BindingConstants.PULL_MODE_DEFAULT;
+        }
+
+        boolean pullModeFlag = pullMode.equalsIgnoreCase(Mcp23017BindingConstants.PULL_MODE_UP);
+
+        logger.error("initializing pin {}, pullMode {}", channel.getIdWithoutGroup(), pullModeFlag);
+
+        if (outputChannels.containsKey(parsePinName(channel))) {
+            throw new IllegalArgumentException("Pin cant be used as input and output at the same time! " + channel);
+        }
+
+        Pair<String, Byte> pinId = parsePinName(channel);
+        inputChannels.put(pinId, channel);
+
+        byte pinNo = pinId.getRight();
+        switch (pinId.getLeft()) {
+            case "A":
+                IODIRA |= 1 << pinNo;
+                break;
+            case "B":
+                IODIRB |= 1 << pinNo;
+                break;
+        }
+
+        if (pullModeFlag) {
+            switch (pinId.getLeft()) {
+                case "A":
+                    GPPUA |= 1 << pinNo;
+                    break;
+                case "B":
+                    GPPUB |= 1 << pinNo;
+                    break;
+            }
+        }
+
+        configurePins();
+
+        logger.error("Bound digital input for PIN: {}, ItemName: {}, pullMode: {}", channel.getIdWithoutGroup(),
+                channel.getAsString(), pullMode);
+    }
+
+    private void initializeOutputPin(ChannelUID channel) throws IOException {
+        logger.error("initializing output pin for channel {}", channel.getAsString());
+
+        Configuration configuration = thing.getChannel(channel.getId()).getConfiguration();
+
+        // PinState pinState = PinState.valueOf((String) configuration.get(DEFAULT_STATE));
+        // logger.debug("initializing for pinState {}", pinState);
+
+        boolean pinStateHigh = false; // TODO Default berücksichtigen
+        String pinName = channel.getIdWithoutGroup(); // like A0 or B7
+        logger.error("initializeOutputPin for channel {}", channel);
+
+        if (inputChannels.containsKey(parsePinName(channel))) {
+            throw new IllegalArgumentException("Pin cant be used as input and output at the same time! " + channel);
+        }
+
+        setOutputPinState(channel, pinStateHigh);
+        configurePins();
+        setOutputLatches();
+        logger.debug("Bound digital output for PIN: {}, channel: {}, pinState: {}", pinName, channel, pinStateHigh);
+    }
+
+    private void handleGpioPinDigitalStateChangeEvent(String bankName, byte pinNo, boolean pinIsHigh) {
+        ChannelUID channel = inputChannels.get(Pair.of(bankName, pinNo));
+        if (channel != null) {
+            OpenClosedType state = pinIsHigh ? OpenClosedType.CLOSED : OpenClosedType.OPEN;
+            logger.debug("updating channel {} with state {}", channel, state);
+
+            updateState(channel, state);
+        }
+    }
+
+    /**
+     * A1 -> ("A", 1)
+     */
+    private Pair<String, Byte> parsePinName(ChannelUID channel) {
+        String pinName = channel.getIdWithoutGroup();
+        String bankName = pinName.substring(0, 1);
+        byte pinNo = Byte.parseByte(pinName.substring(1));
+        Pair<String, Byte> res = Pair.of(bankName, pinNo);
+        return res;
+    }
+
+    private void startPollingThread() {
+        Thread pollingThread = new Thread(new Runnable() {
+
+            private Map<String, Byte> lastInputValues = new HashMap<>();
+
+            /**
+             * Läd die Pin-States einer Bank vom Chip-Register.
+             * Prüft, ob sich bits zur lettzen abfrage geändert haben.
+             * Sendet Chanel-Update bei änderungen.
+             * 
+             * @param bankName
+             * @param gpioRegisterAddress
+             * @throws IOException
+             */
+            private void handleBank(String bankName, byte gpioRegisterAddress) throws IOException {
+
+                byte valuesBank = i2cBusManager.readRegister(i2cAddress, gpioRegisterAddress);
+                byte lastValuesBank = lastInputValues.get(bankName);
+                if (valuesBank != lastValuesBank) {
+                    logger.error("Values Bank {} changed! {} {}", bankName, valuesBank, lastValuesBank);
+
+                    int changedBits = valuesBank ^ lastValuesBank;
+
+                    for (byte pinNo = 0; pinNo < 8; pinNo++) {
+                        if ((changedBits & (1 << pinNo)) > 0) {
+                            // Bit pinNo hat sich geändert
+                            boolean pinIsHigh = (valuesBank & (1 << pinNo)) > 0;
+                            handleGpioPinDigitalStateChangeEvent(bankName, pinNo, pinIsHigh);
+                        }
+                    }
+
+                    lastInputValues.put(bankName, valuesBank);
+                }
+            }
+
+            @Override
+            public void run() {
+
+                logger.error("Thread started!");
+
+                lastInputValues.put("A", (byte) 0);
+                lastInputValues.put("B", (byte) 0);
+
+                Exception lastException = null;
+                int lastRegisterCheck = 0;
+                while (true) {
+                    try {
+                        if (IODIRA != 0) {
+                            handleBank("A", MCP23017Registers.GPIOA);
+                        }
+
+                        if (IODIRB != 0) {
+                            handleBank("B", MCP23017Registers.GPIOB);
+                        }
+
+                        if (lastRegisterCheck > 100) {
+                            // der letzte Check der Register ist mehr als 100 Poll-Intervals her
+
+                            boolean allOk = true;
+                            allOk &= checkRegister(MCP23017Registers.IODIRA, IODIRA);
+                            allOk &= checkRegister(MCP23017Registers.IODIRB, IODIRB);
+
+                            allOk &= checkRegister(MCP23017Registers.GPPUA, GPPUA);
+                            allOk &= checkRegister(MCP23017Registers.GPPUB, GPPUB);
+
+                            allOk &= checkRegister(MCP23017Registers.OLATA, OLATA);
+                            allOk &= checkRegister(MCP23017Registers.OLATB, OLATB);
+
+                            if (allOk) {
+                                lastRegisterCheck = 0;
+                            } // else: im nächsten Durchgang nochmal testen
+
+                        }
+                        lastRegisterCheck++;
+
+                        if (lastException != null) {
+                            // change back to good
+                            updateStatus(ThingStatus.ONLINE);
+                            lastException = null;
+                        }
+
+                    } catch (IOException e) {
+                        if (lastException == null) {
+                            logger.error("Error while polling MCP23017 {}", thing, e);
+                            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.COMMUNICATION_ERROR,
+                                    "Error in Polling-Thread! " + e.getMessage());
+                            lastException = e;
+                        }
+                    }
+
+                    try {
+                        Thread.sleep(POLLING_INTERVAL);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+
+                }
+            }
+
+            private boolean checkRegister(byte register, byte expectedValue) throws IOException {
+                byte curValue = i2cBusManager.readRegister(i2cAddress, register);
+                if (curValue != expectedValue) {
+                    logger.warn("I2C {}/{} : Found unwanted value in register {} Found: {} Expected:{}", i2cBusNumber,
+                            i2cAddress, register, curValue, expectedValue);
+                    i2cBusManager.writeRegister(i2cAddress, register, expectedValue);
+                    return false;
+                }
+                return true;
+            }
+        });
+        pollingThread.start();
     }
 
     private boolean verifyChannel(ChannelUID channelUID) {
@@ -107,18 +369,23 @@ public class Mcp23017Handler extends BaseThingHandler implements GpioPinListener
         return true;
     }
 
-    private void handleOutputCommand(ChannelUID channelUID, Command command) {
+    private void handleOutputCommand(ChannelUID channelUID, Command command) throws IOException {
         if (command instanceof OnOffType) {
-            GpioPinDigitalOutput outputPin = pinStateHolder.getOutputPin(channelUID);
+            // GpioPinDigitalOutput outputPin = pinStateHolder.getOutputPin(channelUID);
             Configuration configuration = this.getThing().getChannel(channelUID.getId()).getConfiguration();
 
+            boolean pinHighState = command == OnOffType.ON;
+
             // invertLogic is null if not configured
-            String activeLowStr = Objects.toString(configuration.get(ACTIVE_LOW), null);
-            boolean activeLowFlag = ACTIVE_LOW_ENABLED.equalsIgnoreCase(activeLowStr);
-            PinState pinState = command == OnOffType.ON ^ activeLowFlag ? PinState.HIGH : PinState.LOW;
-            logger.debug("got output pin {} for channel {} and command {} [active_low={}, new_state={}]", outputPin,
-                    channelUID, command, activeLowFlag, pinState);
-            GPIODataHolder.GPIO.setState(pinState, outputPin);
+            String activeLowStr = Objects.toString(configuration.get(Mcp23017BindingConstants.ACTIVE_LOW), null);
+            boolean activeLowFlag = Mcp23017BindingConstants.ACTIVE_LOW_ENABLED.equalsIgnoreCase(activeLowStr);
+            pinHighState = pinHighState ^ activeLowFlag;
+
+            logger.debug("got output pin {} for channel {} and command {} [active_low={}, new_state={}]",
+                    channelUID.getIdWithoutGroup(), channelUID, command, activeLowFlag, pinHighState);
+
+            setOutputPinState(channelUID, pinHighState);
+            setOutputLatches();
         }
     }
 
@@ -145,84 +412,41 @@ public class Mcp23017Handler extends BaseThingHandler implements GpioPinListener
 
     protected void checkConfiguration() {
         Configuration configuration = getConfig();
-        address = Integer.parseInt((configuration.get(ADDRESS)).toString(), 16);
-        busNumber = Integer.parseInt((configuration.get(BUS_NUMBER)).toString());
+        i2cAddress = Byte.parseByte((configuration.get(ADDRESS)).toString(), 16);
+        i2cBusNumber = Byte.parseByte((configuration.get(BUS_NUMBER)).toString());
     }
 
-    private MCP23017GpioProvider initializeMcpProvider() {
-        MCP23017GpioProvider mcp = null;
-        logger.debug("initializing mcp provider for busNumber {} and address {}", busNumber, address);
-        try {
-            mcp = new MCP23017GpioProvider(busNumber, address);
-            mcp.setPollingTime(POLLING_INTERVAL);
-        } catch (UnsupportedBusNumberException | IOException ex) {
-            updateStatus(ThingStatus.OFFLINE, ThingStatusDetail.CONFIGURATION_ERROR,
-                    "Tried to access not available I2C bus: " + ex.getMessage());
-        }
-        logger.debug("got mcpProvider {}", mcp);
-        return mcp;
+    private void configurePins() throws IOException {
+        i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.IODIRA, IODIRA);
+        i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.GPPUA, GPPUA);
+        i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.IODIRB, IODIRB);
+        i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.GPPUB, GPPUB);
     }
 
-    private GpioPinDigitalInput initializeInputPin(ChannelUID channel) {
-        logger.debug("initializing input pin for channel {}", channel.getAsString());
-        Pin pin = PinMapper.get(channel.getIdWithoutGroup());
-
-        String pullMode = DEFAULT_PULL_MODE;
-        if (thing.getChannel(channel.getId()) != null) {
-            Configuration configuration = thing.getChannel(channel.getId()).getConfiguration();
-            pullMode = ((String) configuration.get(PULL_MODE)) != null ? ((String) configuration.get(PULL_MODE))
-                    : DEFAULT_PULL_MODE;
+    private void setOutputPinState(ChannelUID channel, boolean high) throws IOException {
+        Pair<String, Byte> pinId = parsePinName(channel);
+        byte pinNo = pinId.getRight();
+        switch (pinId.getLeft()) {
+            case "A":
+                OLATA = changePin(OLATA, pinNo, high);
+                i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.OLATA, OLATA);
+                break;
+            case "B":
+                OLATB = changePin(OLATB, pinNo, high);
+                i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.OLATB, OLATB);
+                break;
         }
-        logger.debug("initializing pin {}, pullMode {}, mcpProvider {}", pin, pullMode, mcpProvider);
-        GpioPinDigitalInput input = GPIODataHolder.GPIO.provisionDigitalInputPin(mcpProvider, pin,
-                channel.getIdWithoutGroup(), PinPullResistance.valueOf(pullMode));
-        input.addListener(this);
-        logger.debug("Bound digital input for PIN: {}, ItemName: {}, pullMode: {}", pin, channel.getAsString(),
-                pullMode);
-        return input;
     }
 
-    @Override
-    public void dispose() {
-        final Mcp23017PinStateHolder holder = pinStateHolder;
-
-        if (holder != null) {
-            holder.unBindGpioPins();
+    private byte changePin(byte value, byte pinNo, boolean high) {
+        if (high) {
+            return (byte) (value | (1 << pinNo));
+        } else {
+            return (byte) (value & ~(1 << pinNo));
         }
-
-        super.dispose();
     }
 
-    @Override
-    public void handleGpioPinDigitalStateChangeEvent(GpioPinDigitalStateChangeEvent event) {
-        GpioPin pin = event.getPin();
-        OpenClosedType state = OpenClosedType.CLOSED;
-        if (event.getState() == PinState.LOW) {
-            state = OpenClosedType.OPEN;
-        }
-        ChannelUID channelForPin = pinStateHolder.getChannelForInputPin((GpioPinDigitalInput) pin);
-        logger.debug("updating channel {} with state {}", channelForPin, state);
-        updateState(channelForPin, state);
-    }
-
-    @Override
-    public void channelLinked(ChannelUID channelUID) {
-        synchronized (this) {
-            logger.debug("channel linked {}", channelUID.getAsString());
-            if (!verifyChannel(channelUID)) {
-                return;
-            }
-            String channelGroup = channelUID.getGroupId();
-
-            if (channelGroup != null && channelGroup.equals(CHANNEL_GROUP_INPUT)) {
-                if (pinStateHolder.getInputPin(channelUID) != null) {
-                    return;
-                }
-                GpioPinDigitalInput inputPin = initializeInputPin(channelUID);
-                pinStateHolder.addInputPin(inputPin, channelUID);
-
-            }
-            super.channelLinked(channelUID);
-        }
+    private void setOutputLatches() throws IOException {
+        i2cBusManager.writeRegister(i2cAddress, MCP23017Registers.OLATB, OLATB);
     }
 }

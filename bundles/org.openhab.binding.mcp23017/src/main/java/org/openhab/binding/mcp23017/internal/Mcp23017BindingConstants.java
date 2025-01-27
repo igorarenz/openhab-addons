@@ -38,7 +38,9 @@ public class Mcp23017BindingConstants {
     public static final String BUS_NUMBER = "bus_number";
     public static final String PIN = "pin";
     public static final String PULL_MODE = "pull_mode";
-    public static final String DEFAULT_PULL_MODE = "OFF";
+
+    public static final String PULL_MODE_UP = "PULL_UP";
+    public static final String PULL_MODE_DEFAULT = "OFF";
 
     public static final String ACTIVE_LOW = "active_low";
 

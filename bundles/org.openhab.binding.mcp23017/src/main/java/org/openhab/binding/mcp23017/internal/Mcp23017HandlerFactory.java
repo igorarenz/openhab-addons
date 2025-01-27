@@ -16,6 +16,8 @@ import static org.openhab.binding.mcp23017.internal.Mcp23017BindingConstants.THI
 
 import java.util.Set;
 
+import org.eclipse.jdt.annotation.NonNullByDefault;
+import org.eclipse.jdt.annotation.Nullable;
 import org.openhab.binding.mcp23017.internal.handler.Mcp23017Handler;
 import org.openhab.core.thing.Thing;
 import org.openhab.core.thing.ThingTypeUID;
@@ -33,6 +35,7 @@ import org.slf4j.LoggerFactory;
  * @author Anatol Ogorek - Initial contribution
  */
 @Component(service = ThingHandlerFactory.class, configurationPid = "binding.mcp23017")
+@NonNullByDefault
 public class Mcp23017HandlerFactory extends BaseThingHandlerFactory {
 
     private static final Set<ThingTypeUID> SUPPORTED_THING_TYPES_UIDS = Set.of(THING_TYPE_MCP23017);
@@ -44,6 +47,7 @@ public class Mcp23017HandlerFactory extends BaseThingHandlerFactory {
     }
 
     @Override
+    @Nullable
     protected ThingHandler createHandler(Thing thing) {
         ThingTypeUID thingTypeUID = thing.getThingTypeUID();
         logger.debug("Trying to create handler for {}", thingTypeUID.getAsString());
