@@ -100,7 +100,7 @@ public class I2CBusManager {
     }
 
     public void writeRegister(byte i2cAddress, byte register, byte value) throws IOException {
-        logger.error("Set i2c {} {} {} to {}", i2cBusNumber, Integer.toHexString(i2cAddress),
+        logger.debug("Set i2c {} {} {} to {}", i2cBusNumber, Integer.toHexString(i2cAddress),
                 Integer.toHexString(register), Integer.toBinaryString(value));
 
         synchronized (I2C_LOCK) {

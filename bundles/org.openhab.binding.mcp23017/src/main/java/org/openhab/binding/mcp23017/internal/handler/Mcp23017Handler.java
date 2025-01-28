@@ -128,7 +128,7 @@ public class Mcp23017Handler extends BaseThingHandler {
     @Override
     public void channelLinked(ChannelUID channelUID) {
         synchronized (this) {
-            logger.error("channel linked {}", channelUID.getAsString());
+            logger.debug("channel linked {}", channelUID.getAsString());
             if (!verifyChannel(channelUID)) {
                 return;
             }
@@ -157,7 +157,7 @@ public class Mcp23017Handler extends BaseThingHandler {
     }
 
     private void initializeInputPin(ChannelUID channel) throws IOException {
-        logger.error("initializing input pin for channel {}", channel.getAsString());
+        logger.debug("initializing input pin for channel {}", channel.getAsString());
 
         String pullMode = Mcp23017BindingConstants.PULL_MODE_DEFAULT;
         if (thing.getChannel(channel.getId()) != null) {
@@ -169,7 +169,7 @@ public class Mcp23017Handler extends BaseThingHandler {
 
         boolean pullModeFlag = pullMode.equalsIgnoreCase(Mcp23017BindingConstants.PULL_MODE_UP);
 
-        logger.error("initializing pin {}, pullMode {}", channel.getIdWithoutGroup(), pullModeFlag);
+        logger.debug("initializing pin {}, pullMode {}", channel.getIdWithoutGroup(), pullModeFlag);
 
         if (outputChannels.containsKey(parsePinName(channel))) {
             throw new IllegalArgumentException("Pin cant be used as input and output at the same time! " + channel);
@@ -201,12 +201,12 @@ public class Mcp23017Handler extends BaseThingHandler {
 
         configurePins();
 
-        logger.error("Bound digital input for PIN: {}, ItemName: {}, pullMode: {}", channel.getIdWithoutGroup(),
+        logger.debug("Bound digital input for PIN: {}, ItemName: {}, pullMode: {}", channel.getIdWithoutGroup(),
                 channel.getAsString(), pullMode);
     }
 
     private void initializeOutputPin(ChannelUID channel) throws IOException {
-        logger.error("initializing output pin for channel {}", channel.getAsString());
+        logger.debug("initializing output pin for channel {}", channel.getAsString());
 
         Configuration configuration = thing.getChannel(channel.getId()).getConfiguration();
 
@@ -215,7 +215,6 @@ public class Mcp23017Handler extends BaseThingHandler {
 
         boolean pinStateHigh = false; // TODO Default berücksichtigen
         String pinName = channel.getIdWithoutGroup(); // like A0 or B7
-        logger.error("initializeOutputPin for channel {}", channel);
 
         if (inputChannels.containsKey(parsePinName(channel))) {
             throw new IllegalArgumentException("Pin cant be used as input and output at the same time! " + channel);
@@ -267,7 +266,7 @@ public class Mcp23017Handler extends BaseThingHandler {
                 byte valuesBank = i2cBusManager.readRegister(i2cAddress, gpioRegisterAddress);
                 byte lastValuesBank = lastInputValues.get(bankName);
                 if (valuesBank != lastValuesBank) {
-                    logger.error("Values Bank {} changed! {} {}", bankName, valuesBank, lastValuesBank);
+                    // logger.debug("Values Bank {} changed! {} {}", bankName, valuesBank, lastValuesBank);
 
                     int changedBits = valuesBank ^ lastValuesBank;
 
@@ -286,7 +285,7 @@ public class Mcp23017Handler extends BaseThingHandler {
             @Override
             public void run() {
 
-                logger.error("Thread started!");
+                logger.info("Thread started!");
 
                 lastInputValues.put("A", (byte) 0);
                 lastInputValues.put("B", (byte) 0);
